@@ -23,6 +23,9 @@ export const api = {
   me: () => request("/api/me"),
   symbols: () => request("/api/symbols"),
   history: (symbol) => request(`/api/history/${symbol}`),
+  portfolio: () => request("/api/portfolio"),
+  placeOrder: (order) => request("/api/orders", { method: "POST", body: JSON.stringify(order) }),
+  cancelOrder: (id) => request(`/api/orders/${id}/cancel`, { method: "POST" }),
 };
 
 export const WS_URL = (import.meta.env.VITE_WS_URL || "ws://localhost:4000") + "/ws";

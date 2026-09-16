@@ -117,6 +117,12 @@ export function listSymbols() {
   });
 }
 
+export function getLtp(symbol) {
+  const st = state.get(symbol);
+  if (!st) return null;
+  return st.current ? st.current.close : st.candles[st.candles.length - 1].close;
+}
+
 export function getHistory(symbol) {
   const st = state.get(symbol);
   if (!st) return null;

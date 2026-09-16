@@ -4,6 +4,7 @@ import { Link } from "react-router-dom";
 import { api } from "../lib/api.js";
 import { useLiveFeed } from "../lib/useLiveFeed.js";
 import ChartPanel from "../components/ChartPanel.jsx";
+import OrderPanel from "../components/OrderPanel.jsx";
 import { useAuth } from "../App.jsx";
 
 const RANGES = ["1D", "1W", "1M", "3M", "ALL"];
@@ -154,6 +155,8 @@ export default function Dashboard() {
           </div>
         </div>
       </div>
+
+      <OrderPanel symbol={selected} ltp={current?.ltp} />
     </div>
   );
 }

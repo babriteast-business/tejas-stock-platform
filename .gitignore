@@ -3,5 +3,6 @@ dist/
 .env
 .env.local
 backend/users.json
+backend/portfolios.json
 .DS_Store
 *.log

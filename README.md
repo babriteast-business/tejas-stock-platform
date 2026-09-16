@@ -19,6 +19,12 @@ one-file change (see `backend/marketSimulator.js`, top comment).
   fed by a WebSocket — ticks land on the chart in well under a second
 - **Watchlist**: 10 NSE/BSE symbols (Nifty 50, Sensex, and 8 large-caps)
   with live LTP and % change
+- **Buy/sell orders**: market and limit orders, positions with live P&L,
+  order history — every new account starts with ₹5,00,000 virtual funds.
+  Fills happen against the live simulator now; the order/position data
+  shapes already match Zerodha Kite Connect's own API, so swapping in
+  real orders later is a backend-only change (see `backend/broker.js`,
+  top comment, for exactly what that swap looks like)
 - **Design**: a distinct visual identity (not a generic template) —
   ink-navy + muted gold, editorial serif headlines, monospace numerals
   for price alignment
