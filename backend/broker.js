@@ -1,64 +1,101 @@
 // broker.js
 //
-// Order placement, positions, and holdings — for BUY/SELL, exactly like
-// Zerodha, Groww, Upstox etc.
+// Order placement, positions, wallet — for BUY/SELL, exactly like
+// Zerodha, Groww, Upstox etc. Backed by Postgres now, so records
+// persist across redeploys and restarts.
 //
-// Right now orders fill against the price simulator with virtual funds
-// (₹5,00,000 per new user), because placing REAL orders requires:
-//   1. A Kite Connect (or Upstox/Angel One) developer subscription —
-//      https://kite.trade  (₹2,000/month, gives you api_key + api_secret)
-//   2. Each user completing a one-time broker login (OAuth-style):
-//      redirect them to Kite's login URL -> they log into THEIR OWN
-//      Zerodha account -> Kite redirects back with a request_token ->
-//      you exchange it server-side for an access_token -> store that
-//      token against the user (not their password — you never see it).
-//   3. Swapping placeOrder()/getPositions() below for real calls:
-//        const { KiteConnect } = require("kiteconnect");
-//        const kc = new KiteConnect({ api_key, access_token: user.kiteToken });
-//        await kc.placeOrder("regular", { exchange, tradingsymbol, transaction_type,
-//                                          quantity, order_type, product: "CNC" });
-//   The request/response SHAPE below already matches Kite Connect's own
-//   Orders API, so the frontend and these function signatures don't
-//   need to change — only what's inside each function does.
+// The wallet here is VIRTUAL funds only — users top it up themselves,
+// no real money moves. Letting users deposit REAL money into a
+// balance held by your app is a Prepaid Payment Instrument (PPI)
+// under RBI rules and needs its own authorization — same category as
+// Paytm Wallet, separate from the SEBI broker question. Don't wire a
+// real payment gateway into depositFunds() below without that in place.
 //
-// Until then: this is a real, working paper-trading engine — orders
-// fill against live simulated prices, holdings and P&L are tracked
-// properly, limit orders wait and fill when the price crosses.
+// TO SWITCH TO REAL BROKER ORDERS (Kite Connect etc.), see the header
+// comment this file used to carry — the shape of placeOrder/
+// getPortfolio below already matches what a real broker integration
+// needs, so that swap is unaffected by this Postgres migration.
 
-import fs from "fs";
-import path from "path";
+import { pool, newId } from "./db.js";
 
-const DB_FILE = path.join(process.cwd(), "portfolios.json");
-const STARTING_CASH = 500000; // ₹5,00,000 virtual funds for new users
+export async function getPortfolio(userId) {
+  const walletRes = await pool.query("SELECT cash FROM wallets WHERE user_id = $1", [userId]);
+  const cash = Number(walletRes.rows[0]?.cash ?? 0);
 
-function loadAll() {
-  if (!fs.existsSync(DB_FILE)) return {};
+  const holdingsRes = await pool.query(
+    "SELECT symbol, qty, avg_price FROM holdings WHERE user_id = $1 AND qty > 0",
+    [userId]
+  );
+  const ordersRes = await pool.query(
+    "SELECT * FROM orders WHERE user_id = $1 ORDER BY placed_at DESC LIMIT 50",
+    [userId]
+  );
+
+  return {
+    cash,
+    holdings: holdingsRes.rows.map((h) => ({ symbol: h.symbol, qty: Number(h.qty), avgPrice: Number(h.avg_price) })),
+    orders: ordersRes.rows.map(mapOrder),
+  };
+}
+
+function mapOrder(o) {
+  return {
+    id: o.id,
+    symbol: o.symbol,
+    side: o.side,
+    qty: Number(o.qty),
+    orderType: o.order_type,
+    limitPrice: o.limit_price != null ? Number(o.limit_price) : null,
+    status: o.status,
+    filledPrice: o.filled_price != null ? Number(o.filled_price) : null,
+    placedAt: o.placed_at,
+    filledAt: o.filled_at,
+  };
+}
+
+export async function depositFunds(userId, amount) {
+  amount = Number(amount);
+  if (!amount || amount <= 0) throw new Error("Enter an amount greater than zero");
+  if (amount > 10000000) throw new Error("That's above the per-transaction limit");
+
+  const client = await pool.connect();
   try {
-    return JSON.parse(fs.readFileSync(DB_FILE, "utf-8"));
-  } catch {
-    return {};
+    await client.query("BEGIN");
+    const res = await client.query(
+      "UPDATE wallets SET cash = cash + $1 WHERE user_id = $2 RETURNING cash",
+      [amount, userId]
+    );
+    const newBalance = Number(res.rows[0].cash);
+    await client.query(
+      "INSERT INTO wallet_transactions (id, user_id, type, amount, balance_after) VALUES ($1, $2, 'DEPOSIT', $3, $4)",
+      [newId(), userId, amount, newBalance]
+    );
+    await client.query("COMMIT");
+    return newBalance;
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
   }
 }
 
-function saveAll(data) {
-  fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2));
-}
-
-function ensurePortfolio(userId) {
-  const all = loadAll();
-  if (!all[userId]) {
-    all[userId] = { cash: STARTING_CASH, holdings: {}, orders: [] };
-    saveAll(all);
-  }
-  return all[userId];
-}
-
-export function getPortfolio(userId) {
-  return ensurePortfolio(userId);
+export async function getWalletHistory(userId) {
+  const res = await pool.query(
+    "SELECT * FROM wallet_transactions WHERE user_id = $1 ORDER BY created_at DESC LIMIT 30",
+    [userId]
+  );
+  return res.rows.map((t) => ({
+    id: t.id,
+    type: t.type,
+    amount: Number(t.amount),
+    balanceAfter: Number(t.balance_after),
+    createdAt: t.created_at,
+  }));
 }
 
 // side: "BUY" | "SELL", orderType: "MARKET" | "LIMIT"
-export function placeOrder(userId, { symbol, side, qty, orderType, price, ltp }) {
+export async function placeOrder(userId, { symbol, side, qty, orderType, price, ltp }) {
   if (!["BUY", "SELL"].includes(side)) throw new Error("Invalid order side");
   if (!["MARKET", "LIMIT"].includes(orderType)) throw new Error("Invalid order type");
   qty = Number(qty);
@@ -67,103 +104,149 @@ export function placeOrder(userId, { symbol, side, qty, orderType, price, ltp })
     throw new Error("Limit orders need a valid price");
   }
 
-  const all = loadAll();
-  const portfolio = all[userId] || (all[userId] = { cash: STARTING_CASH, holdings: {}, orders: [] });
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
 
-  const order = {
-    id: Date.now().toString(36) + Math.random().toString(36).slice(2, 7),
-    symbol,
-    side,
-    qty,
-    orderType,
-    limitPrice: orderType === "LIMIT" ? price : null,
-    status: "OPEN",
-    filledPrice: null,
-    placedAt: new Date().toISOString(),
-    filledAt: null,
-  };
+    const id = newId();
+    const isMarket = orderType === "MARKET";
 
-  if (orderType === "MARKET") {
-    fillOrder(portfolio, order, ltp);
-  } else {
-    // Limit order: parked as OPEN. checkLimitOrders() below fills it
-    // once a live tick crosses the limit price.
-    if (side === "BUY") {
-      const cost = qty * price;
-      if (portfolio.cash < cost) throw new Error("Insufficient funds for this limit order");
+    if (isMarket) {
+      await fillOrder(client, userId, { id, symbol, side, qty, fillPrice: ltp });
+      await client.query(
+        `INSERT INTO orders (id, user_id, symbol, side, qty, order_type, limit_price, status, filled_price, filled_at)
+         VALUES ($1,$2,$3,$4,$5,'MARKET',NULL,'FILLED',$6, now())`,
+        [id, userId, symbol, side, qty, ltp]
+      );
     } else {
-      const held = portfolio.holdings[symbol]?.qty || 0;
-      if (held < qty) throw new Error("Insufficient holdings to sell");
+      // Validate the order is plausible before parking it OPEN.
+      if (side === "BUY") {
+        const walletRes = await client.query("SELECT cash FROM wallets WHERE user_id = $1", [userId]);
+        if (Number(walletRes.rows[0].cash) < qty * price) {
+          throw new Error("Insufficient funds for this limit order");
+        }
+      } else {
+        const holdRes = await client.query(
+          "SELECT qty FROM holdings WHERE user_id = $1 AND symbol = $2",
+          [userId, symbol]
+        );
+        if (!holdRes.rows[0] || Number(holdRes.rows[0].qty) < qty) {
+          throw new Error("Insufficient holdings to sell");
+        }
+      }
+      await client.query(
+        `INSERT INTO orders (id, user_id, symbol, side, qty, order_type, limit_price, status)
+         VALUES ($1,$2,$3,$4,$5,'LIMIT',$6,'OPEN')`,
+        [id, userId, symbol, side, qty, price]
+      );
     }
-  }
 
-  portfolio.orders.unshift(order);
-  all[userId] = portfolio;
-  saveAll(all);
-  return order;
+    await client.query("COMMIT");
+    const orderRes = await pool.query("SELECT * FROM orders WHERE id = $1", [id]);
+    return mapOrder(orderRes.rows[0]);
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
 }
 
-function fillOrder(portfolio, order, ltp) {
-  const fillPrice = order.orderType === "MARKET" ? ltp : order.limitPrice;
-  const cost = order.qty * fillPrice;
+// Applies a fill to wallet + holdings. Caller manages the transaction.
+async function fillOrder(client, userId, { symbol, side, qty, fillPrice }) {
+  const cost = qty * fillPrice;
 
-  if (order.side === "BUY") {
-    if (portfolio.cash < cost) throw new Error("Insufficient funds for this order");
-    portfolio.cash -= cost;
-    const existing = portfolio.holdings[order.symbol] || { qty: 0, avgPrice: 0 };
-    const newQty = existing.qty + order.qty;
-    existing.avgPrice = (existing.avgPrice * existing.qty + cost) / newQty;
-    existing.qty = newQty;
-    portfolio.holdings[order.symbol] = existing;
+  if (side === "BUY") {
+    const walletRes = await client.query(
+      "SELECT cash FROM wallets WHERE user_id = $1 FOR UPDATE",
+      [userId]
+    );
+    if (Number(walletRes.rows[0].cash) < cost) throw new Error("Insufficient funds for this order");
+
+    await client.query("UPDATE wallets SET cash = cash - $1 WHERE user_id = $2", [cost, userId]);
+
+    const holdRes = await client.query(
+      "SELECT qty, avg_price FROM holdings WHERE user_id = $1 AND symbol = $2 FOR UPDATE",
+      [userId, symbol]
+    );
+    if (holdRes.rows[0]) {
+      const existingQty = Number(holdRes.rows[0].qty);
+      const existingAvg = Number(holdRes.rows[0].avg_price);
+      const newQty = existingQty + qty;
+      const newAvg = (existingAvg * existingQty + cost) / newQty;
+      await client.query(
+        "UPDATE holdings SET qty = $1, avg_price = $2 WHERE user_id = $3 AND symbol = $4",
+        [newQty, newAvg, userId, symbol]
+      );
+    } else {
+      await client.query(
+        "INSERT INTO holdings (user_id, symbol, qty, avg_price) VALUES ($1,$2,$3,$4)",
+        [userId, symbol, qty, fillPrice]
+      );
+    }
   } else {
-    const existing = portfolio.holdings[order.symbol];
-    if (!existing || existing.qty < order.qty) throw new Error("Insufficient holdings to sell");
-    existing.qty -= order.qty;
-    portfolio.cash += cost;
-    if (existing.qty === 0) delete portfolio.holdings[order.symbol];
-  }
+    const holdRes = await client.query(
+      "SELECT qty FROM holdings WHERE user_id = $1 AND symbol = $2 FOR UPDATE",
+      [userId, symbol]
+    );
+    const existingQty = Number(holdRes.rows[0]?.qty ?? 0);
+    if (existingQty < qty) throw new Error("Insufficient holdings to sell");
 
-  order.status = "FILLED";
-  order.filledPrice = fillPrice;
-  order.filledAt = new Date().toISOString();
+    const remaining = existingQty - qty;
+    if (remaining === 0) {
+      await client.query("DELETE FROM holdings WHERE user_id = $1 AND symbol = $2", [userId, symbol]);
+    } else {
+      await client.query(
+        "UPDATE holdings SET qty = $1 WHERE user_id = $2 AND symbol = $3",
+        [remaining, userId, symbol]
+      );
+    }
+    await client.query("UPDATE wallets SET cash = cash + $1 WHERE user_id = $2", [cost, userId]);
+  }
 }
 
 // Called on every live price tick from server.js so pending limit
-// orders fill the moment the market reaches their price — same as a
-// real exchange's matching engine, just simplified.
-export function checkLimitOrders(symbol, ltp) {
-  const all = loadAll();
-  let changed = false;
+// orders fill the moment the market reaches their price.
+export async function checkLimitOrders(symbol, ltp) {
+  const openRes = await pool.query(
+    "SELECT * FROM orders WHERE status = 'OPEN' AND symbol = $1",
+    [symbol]
+  );
 
-  for (const userId of Object.keys(all)) {
-    const portfolio = all[userId];
-    for (const order of portfolio.orders) {
-      if (order.status !== "OPEN" || order.symbol !== symbol) continue;
-      const crossed =
-        (order.side === "BUY" && ltp <= order.limitPrice) ||
-        (order.side === "SELL" && ltp >= order.limitPrice);
-      if (!crossed) continue;
-      try {
-        fillOrder(portfolio, order, ltp);
-        changed = true;
-      } catch {
-        order.status = "REJECTED";
-        changed = true;
-      }
+  for (const o of openRes.rows) {
+    const limitPrice = Number(o.limit_price);
+    const crossed =
+      (o.side === "BUY" && ltp <= limitPrice) || (o.side === "SELL" && ltp >= limitPrice);
+    if (!crossed) continue;
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await fillOrder(client, o.user_id, {
+        symbol: o.symbol,
+        side: o.side,
+        qty: Number(o.qty),
+        fillPrice: limitPrice,
+      });
+      await client.query(
+        "UPDATE orders SET status = 'FILLED', filled_price = $1, filled_at = now() WHERE id = $2",
+        [limitPrice, o.id]
+      );
+      await client.query("COMMIT");
+    } catch {
+      await client.query("ROLLBACK");
+      await pool.query("UPDATE orders SET status = 'REJECTED' WHERE id = $1", [o.id]);
+    } finally {
+      client.release();
     }
   }
-
-  if (changed) saveAll(all);
 }
 
-export function cancelOrder(userId, orderId) {
-  const all = loadAll();
-  const portfolio = all[userId];
-  if (!portfolio) throw new Error("No portfolio found");
-  const order = portfolio.orders.find((o) => o.id === orderId);
-  if (!order) throw new Error("Order not found");
-  if (order.status !== "OPEN") throw new Error("Only open orders can be cancelled");
-  order.status = "CANCELLED";
-  saveAll(all);
-  return order;
+export async function cancelOrder(userId, orderId) {
+  const res = await pool.query(
+    "UPDATE orders SET status = 'CANCELLED' WHERE id = $1 AND user_id = $2 AND status = 'OPEN' RETURNING *",
+    [orderId, userId]
+  );
+  if (!res.rows[0]) throw new Error("Order not found or already settled");
+  return mapOrder(res.rows[0]);
 }

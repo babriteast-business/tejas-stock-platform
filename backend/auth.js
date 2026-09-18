@@ -1,61 +1,59 @@
-import fs from "fs";
-import path from "path";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
+import { pool, newId } from "./db.js";
 
-const DB_FILE = path.join(process.cwd(), "users.json");
 const JWT_SECRET = process.env.JWT_SECRET || "dev-secret-change-in-production";
-
-function loadUsers() {
-  if (!fs.existsSync(DB_FILE)) return [];
-  try {
-    return JSON.parse(fs.readFileSync(DB_FILE, "utf-8"));
-  } catch {
-    return [];
-  }
-}
-
-function saveUsers(users) {
-  fs.writeFileSync(DB_FILE, JSON.stringify(users, null, 2));
-}
+const SIGNUP_BONUS = 100000; // ₹1,00,000 virtual credit on signup
 
 export async function registerUser(name, email, password) {
-  const users = loadUsers();
-  if (users.find((u) => u.email.toLowerCase() === email.toLowerCase())) {
+  const existing = await pool.query("SELECT id FROM users WHERE lower(email) = lower($1)", [email]);
+  if (existing.rows.length) {
     throw new Error("An account with this email already exists");
   }
+
   const passwordHash = await bcrypt.hash(password, 10);
-  const user = {
-    id: Date.now().toString(36) + Math.random().toString(36).slice(2, 7),
-    name,
-    email,
-    passwordHash,
-    createdAt: new Date().toISOString(),
-    watchlist: ["NIFTY50", "RELIANCE", "TCS", "HDFCBANK"],
-  };
-  users.push(user);
-  saveUsers(users);
-  return publicUser(user);
+  const id = newId();
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query(
+      "INSERT INTO users (id, name, email, password_hash) VALUES ($1, $2, $3, $4)",
+      [id, name, email, passwordHash]
+    );
+    await client.query("INSERT INTO wallets (user_id, cash) VALUES ($1, $2)", [id, SIGNUP_BONUS]);
+    await client.query(
+      "INSERT INTO wallet_transactions (id, user_id, type, amount, balance_after) VALUES ($1, $2, 'BONUS', $3, $3)",
+      [newId(), id, SIGNUP_BONUS]
+    );
+    await client.query("COMMIT");
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
+
+  return { id, name, email, createdAt: new Date().toISOString() };
 }
 
 export async function loginUser(email, password) {
-  const users = loadUsers();
-  const user = users.find((u) => u.email.toLowerCase() === email.toLowerCase());
+  const res = await pool.query("SELECT * FROM users WHERE lower(email) = lower($1)", [email]);
+  const user = res.rows[0];
   if (!user) throw new Error("Invalid email or password");
-  const ok = await bcrypt.compare(password, user.passwordHash);
+  const ok = await bcrypt.compare(password, user.password_hash);
   if (!ok) throw new Error("Invalid email or password");
   return publicUser(user);
 }
 
-export function findUserById(id) {
-  const users = loadUsers();
-  const user = users.find((u) => u.id === id);
+export async function findUserById(id) {
+  const res = await pool.query("SELECT * FROM users WHERE id = $1", [id]);
+  const user = res.rows[0];
   return user ? publicUser(user) : null;
 }
 
 function publicUser(user) {
-  const { passwordHash, ...rest } = user;
-  return rest;
+  return { id: user.id, name: user.name, email: user.email, createdAt: user.created_at };
 }
 
 export function issueToken(user) {

@@ -14,6 +14,9 @@ export default function OrderPanel({ symbol, ltp }) {
   const [msg, setMsg] = useState(null);
   const [busy, setBusy] = useState(false);
   const [portfolio, setPortfolio] = useState(null);
+  const [depositAmount, setDepositAmount] = useState("");
+  const [depositBusy, setDepositBusy] = useState(false);
+  const [depositMsg, setDepositMsg] = useState(null);
 
   const refreshPortfolio = useCallback(() => {
     api.portfolio().then(setPortfolio).catch(() => {});
@@ -58,6 +61,21 @@ export default function OrderPanel({ symbol, ltp }) {
       refreshPortfolio();
     } catch {
       // ignore — order likely already filled/cancelled
+    }
+  }
+
+  async function handleDeposit() {
+    setDepositBusy(true);
+    setDepositMsg(null);
+    try {
+      await api.depositFunds(Number(depositAmount));
+      setDepositAmount("");
+      setDepositMsg({ type: "ok", text: "Funds added" });
+      refreshPortfolio();
+    } catch (err) {
+      setDepositMsg({ type: "err", text: err.message });
+    } finally {
+      setDepositBusy(false);
     }
   }
 
@@ -111,6 +129,21 @@ export default function OrderPanel({ symbol, ltp }) {
           <span className="val">₹{fmt(portfolio?.cash)}</span>
         </div>
 
+        <div className="deposit-row">
+          <input
+            type="number"
+            min="1"
+            placeholder="Amount"
+            value={depositAmount}
+            onChange={(e) => setDepositAmount(e.target.value)}
+          />
+          <button className="btn btn-ghost" onClick={handleDeposit} disabled={depositBusy || !depositAmount}>
+            {depositBusy ? "Adding…" : "Add funds"}
+          </button>
+        </div>
+        {depositMsg && <div className={`order-msg ${depositMsg.type === "err" ? "err" : "ok"}`} style={{ marginTop: 8 }}>{depositMsg.text}</div>}
+
+        <div style={{ marginTop: 14 }}>
         {portfolio?.positions?.length ? (
           portfolio.positions.map((p) => (
             <div className="holding-row" key={p.symbol}>
@@ -127,6 +160,7 @@ export default function OrderPanel({ symbol, ltp }) {
         ) : (
           <div className="empty-note">No open positions yet.</div>
         )}
+        </div>
       </div>
 
       <div className="panel-card">

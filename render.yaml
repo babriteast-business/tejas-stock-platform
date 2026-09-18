@@ -11,6 +11,10 @@ services:
         generateValue: true
       - key: NODE_VERSION
         value: 20.11.0
+      - key: DATABASE_URL
+        fromDatabase:
+          name: tejas-db
+          property: connectionString
 
   - type: web
     runtime: static
@@ -31,3 +35,7 @@ services:
         sync: false
       - key: VITE_WS_URL
         sync: false
+
+databases:
+  - name: tejas-db
+    plan: free

@@ -774,6 +774,28 @@ button {
 .funds-row .label { color: var(--muted); }
 .funds-row .val { font-family: var(--font-num); }
 
+.deposit-row {
+  display: flex;
+  gap: 6px;
+  margin-top: 10px;
+}
+.deposit-row input {
+  flex: 1;
+  min-width: 0;
+  background: var(--ink-700);
+  border: 1px solid var(--line);
+  color: var(--paper);
+  padding: 8px 9px;
+  border-radius: var(--radius-sm);
+  font-family: var(--font-num);
+  font-size: 13px;
+}
+.deposit-row .btn {
+  padding: 8px 12px;
+  font-size: 12.5px;
+  white-space: nowrap;
+}
+
 .holding-row, .order-row {
   padding: 9px 0;
   border-bottom: 1px solid var(--line-soft);

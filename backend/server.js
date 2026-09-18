@@ -2,13 +2,18 @@ import express from "express";
 import cors from "cors";
 import { createServer } from "http";
 import { WebSocketServer } from "ws";
+import { initSchema } from "./db.js";
 import { registerUser, loginUser, findUserById, issueToken, requireAuth } from "./auth.js";
 import { startSimulator, listSymbols, getHistory, getLtp, SYMBOLS } from "./marketSimulator.js";
-import { getPortfolio, placeOrder, checkLimitOrders, cancelOrder } from "./broker.js";
+import { getPortfolio, placeOrder, checkLimitOrders, cancelOrder, depositFunds, getWalletHistory } from "./broker.js";
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+function round(n) {
+  return Math.round(Number(n) * 100) / 100;
+}
 
 // ---------- Auth routes ----------
 
@@ -40,8 +45,8 @@ app.post("/api/auth/login", async (req, res) => {
   }
 });
 
-app.get("/api/me", requireAuth, (req, res) => {
-  const user = findUserById(req.userId);
+app.get("/api/me", requireAuth, async (req, res) => {
+  const user = await findUserById(req.userId);
   if (!user) return res.status(404).json({ error: "User not found" });
   res.json({ user });
 });
@@ -60,22 +65,26 @@ app.get("/api/history/:symbol", (req, res) => {
 
 // ---------- Trading routes (paper-filled until a real broker is wired in) ----------
 
-app.get("/api/portfolio", requireAuth, (req, res) => {
-  const portfolio = getPortfolio(req.userId);
-  const positions = Object.entries(portfolio.holdings).map(([symbol, h]) => {
-    const ltp = getLtp(symbol) ?? h.avgPrice;
-    const pnl = (ltp - h.avgPrice) * h.qty;
-    return { symbol, qty: h.qty, avgPrice: round(h.avgPrice), ltp, pnl: round(pnl) };
-  });
-  res.json({ cash: round(portfolio.cash), positions, orders: portfolio.orders.slice(0, 50) });
+app.get("/api/portfolio", requireAuth, async (req, res) => {
+  try {
+    const portfolio = await getPortfolio(req.userId);
+    const positions = portfolio.holdings.map((h) => {
+      const ltp = getLtp(h.symbol) ?? h.avgPrice;
+      const pnl = (ltp - h.avgPrice) * h.qty;
+      return { symbol: h.symbol, qty: h.qty, avgPrice: round(h.avgPrice), ltp, pnl: round(pnl) };
+    });
+    res.json({ cash: round(portfolio.cash), positions, orders: portfolio.orders });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-app.post("/api/orders", requireAuth, (req, res) => {
+app.post("/api/orders", requireAuth, async (req, res) => {
   try {
     const { symbol, side, qty, orderType, price } = req.body;
     const ltp = getLtp((symbol || "").toUpperCase());
     if (ltp == null) return res.status(400).json({ error: "Unknown symbol" });
-    const order = placeOrder(req.userId, {
+    const order = await placeOrder(req.userId, {
       symbol: symbol.toUpperCase(),
       side,
       qty,
@@ -89,18 +98,34 @@ app.post("/api/orders", requireAuth, (req, res) => {
   }
 });
 
-app.post("/api/orders/:id/cancel", requireAuth, (req, res) => {
+app.post("/api/orders/:id/cancel", requireAuth, async (req, res) => {
   try {
-    const order = cancelOrder(req.userId, req.params.id);
+    const order = await cancelOrder(req.userId, req.params.id);
     res.json({ order });
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
 });
 
-function round(n) {
-  return Math.round(n * 100) / 100;
-}
+// ---------- Wallet routes (virtual funds — see broker.js header) ----------
+
+app.post("/api/wallet/deposit", requireAuth, async (req, res) => {
+  try {
+    const balance = await depositFunds(req.userId, req.body.amount);
+    res.json({ cash: round(balance) });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.get("/api/wallet/history", requireAuth, async (req, res) => {
+  try {
+    const history = await getWalletHistory(req.userId);
+    res.json({ history });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 // ---------- Server + live WebSocket feed ----------
 
@@ -122,13 +147,23 @@ function broadcast(payload) {
   }
 }
 
-startSimulator((update) => {
-  broadcast(update);
-  checkLimitOrders(update.symbol, update.candle.close);
-});
-
 const PORT = process.env.PORT || 4000;
-server.listen(PORT, () => {
-  console.log(`StockTrade backend running on http://localhost:${PORT}`);
-  console.log(`WebSocket feed on ws://localhost:${PORT}/ws`);
-});
+
+initSchema()
+  .then(() => {
+    startSimulator((update) => {
+      broadcast(update);
+      checkLimitOrders(update.symbol, update.candle.close).catch((err) =>
+        console.error("checkLimitOrders error:", err.message)
+      );
+    });
+
+    server.listen(PORT, () => {
+      console.log(`StockTrade backend running on http://localhost:${PORT}`);
+      console.log(`WebSocket feed on ws://localhost:${PORT}/ws`);
+    });
+  })
+  .catch((err) => {
+    console.error("Failed to initialize database schema:", err.message);
+    process.exit(1);
+  });

@@ -26,6 +26,8 @@ export const api = {
   portfolio: () => request("/api/portfolio"),
   placeOrder: (order) => request("/api/orders", { method: "POST", body: JSON.stringify(order) }),
   cancelOrder: (id) => request(`/api/orders/${id}/cancel`, { method: "POST" }),
+  depositFunds: (amount) => request("/api/wallet/deposit", { method: "POST", body: JSON.stringify({ amount }) }),
+  walletHistory: () => request("/api/wallet/history"),
 };
 
 export const WS_URL = (import.meta.env.VITE_WS_URL || "ws://localhost:4000") + "/ws";
